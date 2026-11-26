@@ -1,0 +1,13 @@
+services:
+  build-service:
+    build: .
+    image: build-cancellation-service:dev
+    container_name: build-cancellation-service
+    ports:
+      - "8000:8000"
+    # The service is deliberately single-instance: builds are in-memory state
+    # and child process groups of this one process.
+    deploy:
+      replicas: 1
+    restart: unless-stopped
+    init: false  # the app installs itself as child subreaper on purpose
