@@ -20,9 +20,11 @@ import fcntl
 import logging
 import os
 import select
+import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -33,6 +35,12 @@ from typing import Optional
 from .buffers import TailBuffer
 from .procfs import group_alive, group_pids
 from .reaper import Reaper, describe_status
+from .stacks import (
+    STACK_DIR_ENVVAR,
+    STACK_SIGNAL,
+    STACK_SIGNAL_ENVVAR,
+    StackSampler,
+)
 
 logger = logging.getLogger("buildsvc.build")
 
@@ -41,6 +49,8 @@ POLL_INTERVAL = 0.05
 READER_JOIN_TIMEOUT = 10.0
 KILL_WAIT_TIMEOUT = 10.0
 READY_TIMEOUT = 15.0
+# Upper bound for waiting on in-flight stack samples at build finalization.
+STACK_CLEANUP_WAIT = 35.0
 READY_MARKER = b"READY"
 
 # Build lifecycle states.
@@ -74,6 +84,8 @@ class Build:
     command: list[str]
     reaper: Reaper
     grace_default: float = 5.0
+    stack_root: Optional[str] = None
+    stack_delay: float = 0.0
     stdout: TailBuffer = field(default_factory=lambda: TailBuffer(TAIL_MAX))
     stderr: TailBuffer = field(default_factory=lambda: TailBuffer(TAIL_MAX))
     state: str = RUNNING
@@ -99,16 +111,34 @@ class Build:
         self._supervisor: Optional[threading.Thread] = None
         self._stdout_thread: Optional[threading.Thread] = None
         self._stderr_thread: Optional[threading.Thread] = None
+        self._inflight_lock = threading.Lock()
+        self._inflight = 0
+        self._idle_event = threading.Event()
+        self._idle_event.set()
+        # Build-private directory for stack dumps; the worker learns it via
+        # an env var and only writes inside it.
+        stack_root = self.stack_root or os.path.join(
+            tempfile.gettempdir(), "buildsvc-stacks"
+        )
+        self.stack_dir = os.path.join(stack_root, f"build-{self.build_id}-{uuid.uuid4().hex[:8]}")
+        os.makedirs(self.stack_dir, exist_ok=True)
+        self.sampler = StackSampler(self.stack_dir, signum=STACK_SIGNAL)
 
     # ------------------------------------------------------------------ start
     def start(self) -> None:
         self.started_at = time.time()
+        env = dict(os.environ)
+        env[STACK_DIR_ENVVAR] = self.stack_dir
+        env[STACK_SIGNAL_ENVVAR] = str(STACK_SIGNAL)
+        if self.stack_delay > 0:
+            self.command = [*self.command, "--stack-delay", str(self.stack_delay)]
         self._proc = subprocess.Popen(
             self.command,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             start_new_session=True,  # new process group, group id == leader pid
             close_fds=True,
+            env=env,
         )
         self.pid = self._proc.pid
         self.pgid = self._proc.pid
@@ -296,6 +326,10 @@ class Build:
             self.state = SUCCEEDED
         else:
             self.state = FAILED
+        # Let any in-flight samples resolve (each bounded by its own timeout)
+        # before deleting their dump directory.
+        self._idle_event.wait(timeout=STACK_CLEANUP_WAIT)
+        self._remove_stack_dir()
         self._done_event.set()
         logger.info("build %s finished: %s", self.build_id, self.state)
 
@@ -354,6 +388,36 @@ class Build:
     def wait_done(self, timeout: Optional[float] = None) -> bool:
         return self._done_event.wait(timeout)
 
+    # ------------------------------------------------------------- stack dumps
+    def sample_stacks(self, timeout: float) -> dict:
+        """Snapshot group membership now and sample every member once.
+
+        The roster is fixed at acceptance time: a leader that already exited
+        is absent, while surviving same-group children are included.  Log
+        pumping and cancellation keep running while this blocks.
+        """
+        assert self.pgid is not None
+        with self._inflight_lock:
+            self._inflight += 1
+            self._idle_event.clear()
+        try:
+            pids = group_pids(self.pgid)
+            result = self.sampler.collect(
+                pids=pids, timeout=timeout, ready=self._ready_event.is_set()
+            )
+        finally:
+            with self._inflight_lock:
+                self._inflight -= 1
+                if self._inflight == 0:
+                    self._idle_event.set()
+        result["build_id"] = self.build_id
+        result["pgid"] = self.pgid
+        result["state"] = self.state
+        return result
+
+    def _remove_stack_dir(self) -> None:
+        shutil.rmtree(self.stack_dir, ignore_errors=True)
+
     def snapshot(self) -> dict:
         return {
             "build_id": self.build_id,
@@ -399,9 +463,21 @@ class BuildManager:
         self._worker_path = worker_path
         self._builds: dict[str, Build] = {}
         self._lock = threading.Lock()
+        self._stack_root = os.path.join(
+            tempfile.gettempdir(), "buildsvc-stacks-" + uuid.uuid4().hex[:8]
+        )
+        os.makedirs(self._stack_root, exist_ok=True)
+
+    @property
+    def stack_root(self) -> str:
+        return self._stack_root
 
     def create(
-        self, scenario: list[str], grace_default: float, name: Optional[str]
+        self,
+        scenario: list[str],
+        grace_default: float,
+        name: Optional[str],
+        stack_delay: float = 0.0,
     ) -> Build:
         build_id = name or f"build-{uuid.uuid4().hex[:12]}"
         command = [sys.executable, str(self._worker_path), *scenario]
@@ -411,6 +487,8 @@ class BuildManager:
             command=command,
             reaper=self._reaper,
             grace_default=grace_default,
+            stack_root=self._stack_root,
+            stack_delay=stack_delay,
         )
         with self._lock:
             if build_id in self._builds:
@@ -437,3 +515,4 @@ class BuildManager:
             build.force_cancel(grace_seconds=1.0)
         for build in self._builds.values():
             build.wait_done(timeout=KILL_WAIT_TIMEOUT + 5)
+        shutil.rmtree(self._stack_root, ignore_errors=True)

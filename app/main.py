@@ -16,6 +16,13 @@ from .build import (
     BuildManager,
 )
 from .reaper import Reaper
+from .stacks import (
+    MAX_STACK_TIMEOUT,
+    STACK_ERROR,
+    STACK_EXITED,
+    STACK_OK,
+    STACK_TIMEOUT,
+)
 
 logger = logging.getLogger("buildsvc")
 
@@ -39,6 +46,25 @@ class StartRequest(BaseModel):
     duration: float = Field(default=60.0, ge=0.1, le=3600.0)
     grace_seconds: float = Field(default=DEFAULT_GRACE, ge=0.0, le=MAX_GRACE)
     build_id: Optional[str] = Field(default=None, max_length=64)
+    stack_delay: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=30.0,
+        description=(
+            "Sample-worker only: seconds the stack-dump handler sleeps "
+            "before writing, producing a deliberately late response for "
+            "concurrent-sampling and timeout tests via /docs."
+        ),
+    )
+
+
+class StackSampleRequest(BaseModel):
+    timeout: float = Field(
+        default=5.0,
+        ge=0.0,
+        le=MAX_STACK_TIMEOUT,
+        description="Maximum wait for every member's main-thread stack.",
+    )
 
 
 class CancelRequest(BaseModel):
@@ -109,6 +135,7 @@ def create_app() -> FastAPI:
                 scenario=scenario_cmd,
                 grace_default=req.grace_seconds,
                 name=req.build_id,
+                stack_delay=req.stack_delay,
             )
         except KeyError:
             raise HTTPException(status_code=409, detail="build_id already exists")
@@ -175,6 +202,37 @@ def create_app() -> FastAPI:
         snap = build.snapshot()
         snap["finished_within_timeout"] = finished
         return snap
+
+    @app.post("/builds/{build_id}/stacks")
+    def sample_stacks(build_id: str, req: StackSampleRequest) -> dict:
+        """Capture each live group member's main-thread Python stack.
+
+        Only the bundled sample worker answers the sampling signal.  The
+        member roster is fixed at request acceptance: a leader that already
+        exited is omitted, surviving same-group children are sampled.  Each
+        member comes back as ``ok`` (stack included), ``exited`` (died
+        mid-sample) or ``timeout`` (still alive but no dump before the
+        deadline).  Concurrent samples are isolated by per-PID sequence
+        numbers; late dumps of an expired sample never enter later samples.
+        Log collection and cancellation keep working while sampling.
+        """
+        build = get_build_or_404(build_id)
+        if build.state in TERMINAL_STATES or build.pgid is None:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"build {build_id!r} is in terminal state {build.state!r}; "
+                    "no live group members to sample"
+                ),
+            )
+        result = build.sample_stacks(timeout=req.timeout)
+        result["status_legend"] = {
+            STACK_OK: "main-thread stack captured",
+            STACK_EXITED: "member exited (or became zombie) before responding",
+            STACK_TIMEOUT: "member alive but did not respond before timeout",
+            STACK_ERROR: "signal or dump-file handling failed",
+        }
+        return result
 
     return app
 
